@@ -94,7 +94,7 @@ The formula is parameterized by two constants $\sigma$ and $\epsilon$, which var
   &nbsp;
 </p>
 
-<i> <b>Figure 3.</b> Potential energy surface for vdW interactions between neon-neon and argon-argon pairs[^4]. Å is a unit equivalent to 0.1 nanometers. The global minimum is -0.009 eV for neon and -0.014 eV for argon. </i>
+<i> <b>Figure 3.</b> Potential energy surfaces for vdW interactions between neon-neon and argon-argon pairs[^4]. Å is a unit equivalent to 0.1 nanometers. The global minimum is -0.009 eV for neon and -0.014 eV for argon. </i>
 
 <div align="center">
 
@@ -132,7 +132,7 @@ $\epsilon_{ij} = \sqrt{\epsilon_{ii} \epsilon_{jj}}$
 
 <i> <b>Figure 5.</b> vdW energies using the Waldman-Hagler rule. </i>
 
-Before running the simulation, one needs to choose the time step. Truncation error of the velocity Verlet integrator scales with $O(h^2)$, so doubling the time step leads to 4x error. However, the end goal is to run an MD simulation as fast as possible. Using larger time steps means the simulation can finish more quickly. A standard practice is setting the time step to $\frac{1}{10}$ the duration of the highest-frequency motions you want to capture[^6]. For example, carbon-hydrogen bonds vibrate with a period 11 fs, so timesteps are typically ~1.1 fs (fs = femtosecond; 10<sup>-15</sup> seconds). The van der Waals attraction between noble gas atoms has a vibrational period of ~1000 fs, several orders of magnitude higher (Eqn. 6, Fig. 6). I will stick with a conservative 1 fs timestep, but 100 fs could theoretically work as well.
+Before running the simulation, one needs to choose the time step. Truncation error of the velocity Verlet integrator scales with $O(h^2)$, so doubling the time step leads to 4x error. However, the end goal is to run an MD simulation as fast as possible. Using larger time steps means the simulation can finish more quickly. A standard practice is setting the time step to $\frac{1}{10}$ the duration of the highest-frequency motions you want to capture[^6]. For example, carbon-hydrogen bonds vibrate with a period of 11 fs, so timesteps are typically ~1.1 fs (fs = femtosecond; 10<sup>-15</sup> seconds). The van der Waals attraction between noble gas atoms has a vibrational period of ~1000 fs, several orders of magnitude higher (Eqn. 6, Fig. 6). I will stick with a conservative 1 fs timestep, but 100 fs could theoretically work as well.
 
 <div align="center">
 
