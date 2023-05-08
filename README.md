@@ -28,7 +28,7 @@ There are numerous software libraries for molecular dynamics, each specializing 
 
 </div>
 
-<i> <b>Figure 2.</b> Simulation speed of various molecular dynamics libraries when the timestep is 4 fs. OpenMM GPU (red) is faster than all other libraries for up to 1,000,000 atoms. The orange line is the Swift code developed for this research paper. It utilizes SIMD parallelism to achieve $O(n)$ scaling between 1 - 8 atoms, faces $O(n^2)$ scaling until 100 atoms, then temporarily becomes $O(n)$ as it utilizes multithreading. At 300 atoms, the Swift code becomes slower than OpenMM.</i>
+<i> <b>Figure 2.</b> Simulation speed of various molecular dynamics libraries when the timestep is 4 fs. OpenMM (red) is faster than all other libraries for 300 - 1 million atoms. The orange line is the Swift code developed for this research paper. It utilizes SIMD parallelism to achieve $O(n)$ scaling between 1 - 8 atoms, faces $O(n^2)$ scaling until 100 atoms, then temporarily becomes $O(n)$ as it utilizes multithreading. At 300 atoms, the Swift code becomes slower than OpenMM.</i>
 
 ## Methods
 
