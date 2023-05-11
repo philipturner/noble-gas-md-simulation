@@ -9,6 +9,7 @@ import Foundation
 import PythonKit
 import simd
 import QuartzCore
+import Metal
 
 PythonLibrary.useLibrary(at: "/Users/philipturner/miniforge3/bin/python")
 let plt = Python.import("matplotlib.pyplot")
@@ -118,6 +119,8 @@ class LJPotentialParametersMatrix {
   var width: Int
   var height: Int
   var elements: UnsafeMutableBufferPointer<LJPotentialParameters>
+  var gpuBuffer: MTLBuffer?
+  var gpuOffset: Int = 0
   
   init(width: Int, height: Int) {
     self.width = width
@@ -127,6 +130,18 @@ class LJPotentialParametersMatrix {
     let initial = LJPotentialParameters(sigma: 0, epsilon: 0)
     self.elements = .allocate(capacity: size)
     self.elements.initialize(repeating: initial)
+  }
+  
+  func initializeGPU(device: MTLDevice) {
+    let numBytes = width * height * MemoryLayout<LJPotentialParameters>.stride
+    let addressBase = UInt(bitPattern: elements.baseAddress!)
+    let addressAligned = ~(4096 - 1) & addressBase
+    let pointerAligned = UnsafeMutableRawPointer(bitPattern: addressAligned)!
+    let numBytesAligned = ~(4096 - 1) & (numBytes + 4096 - 1)
+    
+    self.gpuBuffer = device.makeBuffer(
+      bytesNoCopy: pointerAligned, length: numBytesAligned)!
+    self.gpuOffset = Int(addressBase - addressAligned)
   }
   
   func index(row: Int, column: Int) -> Int {
@@ -288,12 +303,26 @@ struct Vector<T> {
   var alignedCount: Int
   private(set) var elements: [T]
   var bufferPointer: UnsafeMutableBufferPointer<T>
+  var gpuBuffer: MTLBuffer?
+  var gpuOffset: Int = 0
   
   init(repeating repeatedValue: T, count: Int, alignment: Int) {
     self.count = count
     self.alignedCount = ~(alignment - 1) & (count + alignment - 1)
     self.elements = Array(repeating: repeatedValue, count: alignedCount)
     self.bufferPointer = elements.withUnsafeMutableBufferPointer { $0 }
+  }
+  
+  mutating func initializeGPU(device: MTLDevice) {
+    let numBytes = alignedCount * MemoryLayout<T>.stride
+    let addressBase = UInt(bitPattern: bufferPointer.baseAddress!)
+    let addressAligned = ~(4096 - 1) & addressBase
+    let pointerAligned = UnsafeMutableRawPointer(bitPattern: addressAligned)!
+    let numBytesAligned = ~(4096 - 1) & (numBytes + 4096 - 1)
+    
+    self.gpuBuffer = device.makeBuffer(
+      bytesNoCopy: pointerAligned, length: numBytesAligned)!
+    self.gpuOffset = Int(addressBase - addressAligned)
   }
   
   // A highly performant index into the array.
@@ -379,8 +408,11 @@ class AtomicMasses {
   // Mass of each element on the periodic table, in kg.
   private var elements: Vector<Double>
   
+  // Pretend-masked as 'Double' in Swift, but actually 'DoubleSingle'
+  private(set) var elementsGPU: Vector<Double>?
+  
   init() {
-    elements = .init(repeating: 0, count: 119, alignment: 1)
+    self.elements = .init(repeating: 0, count: 119, alignment: 1)
     
     let amuToGrams = 1 / Double(6.022e23)
     let amuToKg = amuToGrams / 1000
@@ -388,6 +420,17 @@ class AtomicMasses {
     elements.setElement(20.1797 * amuToKg, index: 10)
     elements.setElement(39.948 * amuToKg, index: 18)
     elements.setElement(83.798 * amuToKg, index: 36)
+  }
+  
+  func initializeGPU(device: MTLDevice) {
+    self.elementsGPU = .init(repeating: 0, count: 119, alignment: 1)
+    self.elementsGPU?.initializeGPU(device: device)
+    
+    for index in 0..<elementsGPU!.count {
+      let fp64 = simd_precise_recip(self.elements.getElement(index: index))
+      let fp32 = unsafeBitCast(DoubleSingle(fp64), to: Double.self)
+      self.elementsGPU?.setElement(fp32, index: index)
+    }
   }
   
   @inline(__always)
@@ -422,6 +465,28 @@ struct System {
   var ljParameters: LJPotentialParametersMatrix
   var masses: AtomicMasses
   var accelerationsInitialized: Bool = false
+  
+  // Resources for GPU acceleration
+  var useGPU: Bool = false
+  var device: MTLDevice
+  var commandQueue: MTLCommandQueue
+  var commandBuffer: MTLCommandBuffer?
+  var encoder: MTLComputeCommandEncoder?
+  
+  // Arguments for the GPU kernel
+  struct Arguments {
+    var h: DoubleSingle
+    var billionth: DoubleSingle
+    var thousandth: DoubleSingle
+  }
+  
+  // If this value changes, stall the pipeline to avoid corrupting the other
+  // command buffers.
+  var lastH: Double = -1
+  var argumentsBuffer: MTLBuffer
+  var updatePositionsPipeline: MTLComputePipelineState
+  var updateVelocitiesPipeline: MTLComputePipelineState
+  // ICB, which can be optionally enabled or disabled
   
   // Atomic number
   private var element: Vector<UInt8>
@@ -463,6 +528,23 @@ struct System {
     self.a_x = .init(repeating: 0, count: atoms, alignment: align)
     self.a_y = .init(repeating: 0, count: atoms, alignment: align)
     self.a_z = .init(repeating: 0, count: atoms, alignment: align)
+    
+    self.device = MTLCopyAllDevices().first!
+    self.commandQueue = device.makeCommandQueue(maxCommandBufferCount: 8)!
+    
+    let source = createGPUEvolveSrc()
+    let options = MTLCompileOptions()
+    options.fastMathEnabled = false
+    let library = try! device.makeLibrary(source: source, options: options)
+    
+    self.argumentsBuffer = device.makeBuffer(
+      length: MemoryLayout<Arguments>.stride)!
+    self.updatePositionsPipeline = try! device
+      .makeComputePipelineState(function: library
+        .makeFunction(name: "updatePositions")!)
+    self.updateVelocitiesPipeline = try! device
+      .makeComputePipelineState(function: library
+        .makeFunction(name: "updateVelocities")!)
   }
   
   mutating func initializeAccelerations() {
@@ -472,21 +554,75 @@ struct System {
     self.accelerationsInitialized = true
   }
   
+  // Tell the system to use the GPU for the bulk of the computations. This is
+  // a partial port from CPU -> GPU, offloading the computations but not fully
+  // optimizing them with ICBs and interleaved memory formats.
+  mutating func initializeGPU() {
+    self.useGPU = true
+    self.ljParameters.initializeGPU(device: device)
+    self.masses.initializeGPU(device: device)
+    
+    self.element.initializeGPU(device: device)
+    
+    self.x.initializeGPU(device: device)
+    self.y.initializeGPU(device: device)
+    self.z.initializeGPU(device: device)
+    
+    self.v_x.initializeGPU(device: device)
+    self.v_y.initializeGPU(device: device)
+    self.v_z.initializeGPU(device: device)
+    
+    self.a_x.initializeGPU(device: device)
+    self.a_y.initializeGPU(device: device)
+    self.a_z.initializeGPU(device: device)
+  }
+  
+  // Call this *before* creating the next command buffer and encoder.
+  mutating func updateArguments(timeStep h: Double) {
+    guard lastH != h else {
+      return
+    }
+    synchronizeGPU()
+    self.lastH = h
+    
+    let dst = argumentsBuffer.contents().assumingMemoryBound(to: Arguments.self)
+    dst.pointee = Arguments(
+      h: .init(h), billionth: .init(1e-9), thousandth: .init(1e-3))
+  }
+  
+  mutating func synchronizeGPU() {
+    if let commandBuffer {
+      if let encoder {
+        encoder.endEncoding()
+        self.encoder = nil
+      }
+      if commandBuffer.status == .notEnqueued {
+        commandBuffer.commit()
+      }
+      commandBuffer.waitUntilCompleted()
+      self.commandBuffer = nil
+    }
+  }
+  
   mutating func setType(_ value: UInt8, index: Int) {
+    precondition(commandBuffer == nil)
     element.setElement(value, index: index)
   }
   
   mutating func getType(index: Int) -> UInt8 {
+    precondition(commandBuffer == nil)
     return element.getElement(index: index)
   }
   
   mutating func setPosition(_ value: SIMD3<Real>, index: Int) {
+    precondition(commandBuffer == nil)
     x.setElement(value.x, index: index)
     y.setElement(value.y, index: index)
     z.setElement(value.z, index: index)
   }
   
   mutating func getPosition(index: Int) -> SIMD3<Real> {
+    precondition(commandBuffer == nil)
     return SIMD3(
       x.getElement(index: index),
       y.getElement(index: index),
@@ -495,16 +631,27 @@ struct System {
   }
   
   mutating func setVelocity(_ value: SIMD3<Real>, index: Int) {
+    precondition(commandBuffer == nil)
     v_x.setElement(value.x, index: index)
     v_y.setElement(value.y, index: index)
     v_z.setElement(value.z, index: index)
   }
   
   mutating func getVelocity(index: Int) -> SIMD3<Real> {
+    precondition(commandBuffer == nil)
     return SIMD3(
       v_x.getElement(index: index),
       v_y.getElement(index: index),
       v_z.getElement(index: index)
+    )
+  }
+  
+  mutating func getAcceleration(index: Int) -> SIMD3<Real> {
+    precondition(commandBuffer == nil)
+    return SIMD3(
+      a_x.getElement(index: index),
+      a_y.getElement(index: index),
+      a_z.getElement(index: index)
     )
   }
 }
@@ -523,9 +670,11 @@ extension System {
       let type = getType(index: i)
       let position = getPosition(index: i)
       let velocity = getVelocity(index: i)
+      let acceleration = getAcceleration(index: i)
       output.append("Z=\(type)\t ")
-      output.append("p = \(fmt(position))\t nm ")
-      output.append("v = \(fmt(velocity))\t nm/ps")
+      output.append("p = \(fmt(position)) nm \t")
+      output.append("v = \(fmt(velocity)) nm/ps \t")
+      output.append("a = \(fmt(acceleration)) nm/ps/s")
       output.append("\n")
     }
     if output.count > 0 {
@@ -543,8 +692,30 @@ extension System {
   // 'timesStep' is in seconds.
   mutating func evolve(timeStep h: Double, steps: Int = 1) {
     precondition(accelerationsInitialized)
-    for _ in 0..<steps {
-      self._evolve(timeStep: h)
+    if !useGPU {
+      for _ in 0..<steps {
+        self._evolve(timeStep: h)
+      }
+    } else {
+      var i = 0
+      let chunkSize = 512 // Number of timesteps per command buffer.
+      while true {
+        var shouldExit = false
+        var i_next = i + chunkSize
+        if i_next >= steps {
+          shouldExit = true
+          i_next = steps
+        }
+        
+        self._evolveGPU(timeStep: h, steps: i_next - i)
+        
+        if shouldExit {
+          break
+        } else {
+          i = i_next
+        }
+      }
+      self.synchronizeGPU()
     }
   }
   
@@ -670,7 +841,7 @@ extension System {
         // aJ: 1e-18, but needs to be scaled by 1/12
         var u_next: Block = .zero
         
-        // Find new acceleration and update velocities.
+        // Find new accelerations and update velocities.
         defer {
           // kg: 1e0
           var mass: WideBlock = .zero
@@ -889,10 +1060,54 @@ extension System {
       }
     }
   }
+  
+  // Creates a command buffer and encodes the specified number of steps.
+  private mutating func _evolveGPU(timeStep h: Double, steps: Int) {
+    self.updateArguments(timeStep: h)
+    
+    self.commandBuffer = commandQueue.makeCommandBuffer()!
+    self.encoder = commandBuffer!.makeComputeCommandEncoder()!
+    
+    encoder!.setBuffer(argumentsBuffer, offset: 0, index: 0)
+    encoder!.setBuffer(x.gpuBuffer!, offset: x.gpuOffset, index: 1)
+    encoder!.setBuffer(y.gpuBuffer!, offset: y.gpuOffset, index: 2)
+    encoder!.setBuffer(z.gpuBuffer!, offset: z.gpuOffset, index: 3)
+    encoder!.setBuffer(v_x.gpuBuffer!, offset: v_x.gpuOffset, index: 4)
+    encoder!.setBuffer(v_y.gpuBuffer!, offset: v_y.gpuOffset, index: 5)
+    encoder!.setBuffer(v_z.gpuBuffer!, offset: v_z.gpuOffset, index: 6)
+    encoder!.setBuffer(a_x.gpuBuffer!, offset: a_x.gpuOffset, index: 7)
+    encoder!.setBuffer(a_y.gpuBuffer!, offset: a_y.gpuOffset, index: 8)
+    encoder!.setBuffer(a_z.gpuBuffer!, offset: a_z.gpuOffset, index: 9)
+    encoder!.setBuffer(element.gpuBuffer!, offset: element.gpuOffset, index: 10)
+    
+    let mass = self.masses.elementsGPU!
+    encoder!.setBuffer(mass.gpuBuffer!, offset: mass.gpuOffset, index: 11)
+    let params = self.ljParameters
+    encoder!.setBuffer(params.gpuBuffer!, offset: params.gpuOffset, index: 12)
+    
+    precondition(atoms < UInt16.max, "Too many atoms.")
+    for _ in 0..<steps {
+      let atomsSize = MTLSizeMake(atoms, 1, 1)
+      let tgSize = MTLSizeMake(256, 1, 1)
+      encoder!.setComputePipelineState(updatePositionsPipeline)
+      encoder!.dispatchThreads(atomsSize, threadsPerThreadgroup: tgSize)
+      
+      let quadsSize = MTLSizeMake(4 * atoms, 1, 1)
+      encoder!.setComputePipelineState(updateVelocitiesPipeline)
+      encoder!.dispatchThreads(quadsSize, threadsPerThreadgroup: tgSize)
+    }
+    
+    encoder!.endEncoding()
+    encoder = nil
+    commandBuffer!.commit()
+  }
 }
 
 // When testing speed, do not graph the results.
 let testingSpeed: Bool = false
+
+// Whether to use GPU acceleration. This only helps at around 100 atoms.
+let useGPU: Bool = false
 
 if testingSpeed {
   // MARK: - Testing Speed
@@ -932,17 +1147,32 @@ if testingSpeed {
         
         let xyzDeltaReal = SIMD3<Real>(SIMD3(x, y, z))
         system.setPosition(Real(gridSpacing) * xyzDeltaReal, index: atomIndex)
-        system.setPosition(.zero, index: atomIndex)
+        system.setVelocity(.zero, index: atomIndex)
       }
     }
   }
   system.initializeAccelerations()
+  if useGPU {
+    system.initializeGPU()
+  }
+  
+  let debugAtoms = false
+  if debugAtoms {
+    print()
+    print(system.description(atomRange: 0..<system.atoms))
+  }
   
   // Run `maxTimeSteps` multiple times in a loop.
   var minIRLTime: Double = .infinity
   for _ in 0..<trials {
     let start = CACurrentMediaTime()
     system.evolve(timeStep: timeStep, steps: maxTimeSteps)
+    
+    if debugAtoms {
+      print()
+      print(system.description(atomRange: 0..<system.atoms))
+    }
+    
     let end = CACurrentMediaTime()
     minIRLTime = min(minIRLTime, end - start)
   }
@@ -1019,10 +1249,10 @@ if testingSpeed {
     
     // START - ad-hoc place for simulation hyperparameters
     
-    let femtoseconds: Double = 1 // 4 for measuring ns/day
+    let femtoseconds: Double = 1
     let timeStep: Double = 1e-15 * femtoseconds
-    let stepsPerSample: Int = 10 // 1000 for measuring ns/day
-    let maxTimeSteps: Int = Int(20_000 / femtoseconds)
+    let stepsPerSample: Int = 10
+    let maxTimeSteps: Int = Int(20_000 / femtoseconds) // 20_000
     var positions1: [[SIMD3<Real>]] = Array(repeating: [], count: system.atoms)
     var velocities1: [[SIMD3<Real>]] = Array(repeating: [], count: system.atoms)
     var kineticEnergies: [Double] = []
@@ -1070,6 +1300,9 @@ if testingSpeed {
       }
     }
     system.initializeAccelerations()
+    if useGPU {
+      system.initializeGPU()
+    }
     
     // Minimum average distance over all the points. Gathering this metric takes
     // O(n^2) computations.
@@ -1226,4 +1459,432 @@ if testingSpeed {
   }
   
   plt.show()
+}
+
+// MARK: - GPU Support
+
+struct DoubleSingle {
+  var hi: Float
+  var lo: Float
+  
+  init(_ value: Double) {
+    self.hi = Float(value)
+    self.lo = Float(value - Double(hi))
+  }
+}
+
+func createGPUEvolveSrc() -> String { """
+#include <metal_stdlib>
+using namespace metal;
+
+struct DoubleSingle {
+  float hi;
+  float lo;
+};
+
+typedef struct DoubleSingle DS;
+
+DS DS_init(float hi, float lo) {
+  DS output;
+  output.hi = hi;
+  output.lo = lo;
+  return output;
+}
+
+DS DS_negated(DS input) {
+  return DS_init(-input.hi, -input.lo);
+}
+
+DS DS_halved(DS input) {
+  return DS_init(input.hi / 2, input.lo / 2);
+}
+
+DS DS_normalized(DS input) {
+  float s = input.hi + input.lo;
+  float e = input.lo - (s - input.hi);
+  return DS_init(s, e);
+}
+
+DS DS_init_adding(float lhs, float rhs) {
+  float s = lhs + rhs;
+  float v = s - lhs;
+  float e = (lhs - (s - v)) + (rhs - v);
+  return DS_init(s, e);
+}
+
+DS DS_init_multiplying(float lhs, float rhs) {
+  float hi = lhs * rhs;
+  float lo = fma(lhs, rhs, -hi);
+  return DS_init(hi, lo);
+}
+
+// Addition and Subtraction
+
+DS DS_add(DS lhs, DS rhs) {
+  DS s = DS_init_adding(lhs.hi, rhs.hi);
+  s.lo += lhs.lo + rhs.lo;
+  return DS_normalized(s);
+}
+
+DS DS_add_float_rhs(DS lhs, float rhs) {
+  DS s = DS_init_adding(lhs.hi, rhs);
+  s.lo += lhs.lo;
+  return DS_normalized(s);
+}
+
+DS DS_add_float_lhs(float lhs, DS rhs) {
+  return DS_add_float_rhs(rhs, lhs);
+}
+
+DS DS_sub(DS lhs, DS rhs) {
+  return DS_add(lhs, DS_negated(rhs));
+}
+
+DS DS_sub_float_rhs(DS lhs, float rhs) {
+  return DS_add_float_rhs(lhs, -rhs);
+}
+
+DS DS_sub_float_lhs(float lhs, DS rhs) {
+  return DS_add_float_lhs(lhs, DS_negated(rhs));
+}
+
+// Multiplication and Division
+
+DS DS_mul(DS lhs, DS rhs) {
+  DS p = DS_init_multiplying(lhs.hi, rhs.hi);
+  p.lo = fma(lhs.hi, rhs.lo, p.lo);
+  p.lo = fma(lhs.lo, rhs.hi, p.lo);
+  return DS_normalized(p);
+}
+
+DS DS_mul_float_rhs(DS lhs, float rhs) {
+  DS p = DS_init_multiplying(lhs.hi, rhs);
+  p.lo = fma(lhs.lo, rhs, p.lo);
+  return DS_normalized(p);
+}
+
+DS DS_mul_float_lhs(float lhs, DS rhs) {
+  return DS_mul_float_rhs(rhs, lhs);
+}
+
+DS DS_div(DS lhs, DS rhs) {
+  float xn = fast::divide(1, rhs.hi);
+  float yn = lhs.hi * xn;
+  DS ayn = DS_mul_float_rhs(rhs, yn);
+  float diff = DS_sub(lhs, ayn).hi;
+  DS prod = DS_init_multiplying(xn, diff);
+  DS q = DS_add_float_lhs(yn, prod);
+  
+  // Don't handle infinity case because any `INF` will cause undefined
+  // behavior in other code anyway.
+  return q;
+}
+
+DS DS_recip(DS input) {
+  float xn = fast::divide(1, input.hi);
+  DS ayn = DS_mul_float_rhs(input, xn);
+  float diff = DS_sub_float_lhs(1, ayn).hi;
+  DS prod = DS_init_multiplying(xn, diff);
+  DS q = DS_add_float_lhs(xn, prod);
+  
+  // Don't handle infinity case because any `INF` will cause undefined
+  // behavior in other code anyway.
+  return q;
+}
+
+// Kernels
+
+// FP64 numbers pre-computed to FP32 on the CPU.
+typedef struct {
+  DS h;
+  DS billionth;
+  DS thousandth;
+} Arguments;
+
+kernel void updatePositions(
+  // Generate by casting the float from fp64 -> fp32 on CPU, then casting back
+  // to fp64 and measuring the difference. Do the same when converting masses
+  // into a GPU-compatible format.
+  constant Arguments &args [[buffer(0)]],
+
+  // State variables.
+  device float *x [[buffer(1)]],
+  device float *y [[buffer(2)]],
+  device float *z [[buffer(3)]],
+  device float *v_x [[buffer(4)]],
+  device float *v_y [[buffer(5)]],
+  device float *v_z [[buffer(6)]],
+  device float *a_x [[buffer(7)]],
+  device float *a_y [[buffer(8)]],
+  device float *a_z [[buffer(9)]],
+
+  // Loop index.
+  ushort i [[thread_position_in_grid]]
+) {
+  // nm: 1e-9
+  float x_curr = x[i];
+  float y_curr = y[i];
+  float z_curr = z[i];
+
+  // nm/ps: 1e3
+  float v_x_curr = v_x[i];
+  float v_y_curr = v_y[i];
+  float v_z_curr = v_z[i];
+
+  // nm/ps/s: 1e3
+  float a_x_curr = a_x[i];
+  float a_y_curr = a_y[i];
+  float a_z_curr = a_z[i];
+
+  // m: 1e0
+  DS nm___m = args.billionth;
+  DS x_next = DS_mul_float_rhs(nm___m, x_curr);
+  DS y_next = DS_mul_float_rhs(nm___m, y_curr);
+  DS z_next = DS_mul_float_rhs(nm___m, z_curr);
+
+  float nm_ps___m_s = 1e3;
+  DS h = args.h;
+  DS v_scale = DS_mul_float_lhs(nm_ps___m_s, h);
+  x_next = DS_add(x_next, DS_mul_float_rhs(v_scale, v_x_curr));
+  y_next = DS_add(y_next, DS_mul_float_rhs(v_scale, v_y_curr));
+  z_next = DS_add(z_next, DS_mul_float_rhs(v_scale, v_z_curr));
+
+  float nm_ps_s___m_s2 = 1e3;
+  DS multiplier = DS_mul_float_lhs(0.5, DS_mul(h, h));
+  DS a_scale = DS_mul_float_lhs(nm_ps_s___m_s2, multiplier);
+  x_next = DS_add(x_next, DS_mul_float_rhs(a_scale, a_x_curr));
+  y_next = DS_add(y_next, DS_mul_float_rhs(a_scale, a_y_curr));
+  z_next = DS_add(z_next, DS_mul_float_rhs(a_scale, a_z_curr));
+
+  // nm: 1e-9
+  float m___nm = 1e9;
+  float x_i = DS_mul_float_rhs(x_next, m___nm).hi;
+  float y_i = DS_mul_float_rhs(y_next, m___nm).hi;
+  float z_i = DS_mul_float_rhs(z_next, m___nm).hi;
+
+  // Update the positions *before* calculating forces.
+  // You never query energy or update acceleration on the GPU.
+  x[i] = x_i;
+  y[i] = y_i;
+  z[i] = z_i;
+}
+
+struct LJPotentialParameters {
+  union {
+    float2 _data;
+    struct {
+      float c12;
+      float c6;
+    };
+  };
+};
+
+template <uint width, uint height>
+struct LJPotentialParametersMatrix {
+  device LJPotentialParameters* elements;
+
+  uint index(uint row, uint column) {
+    return width * row + column;
+  }
+
+  LJPotentialParameters getElement(uint index) {
+    return elements[index];
+  }
+};
+
+kernel void updateVelocities(
+  constant Arguments &args [[buffer(0)]],
+
+  // State variables.
+  device float *x [[buffer(1)]],
+  device float *y [[buffer(2)]],
+  device float *z [[buffer(3)]],
+  device float *v_x [[buffer(4)]],
+  device float *v_y [[buffer(5)]],
+  device float *v_z [[buffer(6)]],
+  device float *a_x [[buffer(7)]],
+  device float *a_y [[buffer(8)]],
+  device float *a_z [[buffer(9)]],
+  device uchar *element [[buffer(10)]],
+
+  device DS *massesInv [[buffer(11)]],
+  device LJPotentialParameters *paramsRaw [[buffer(12)]],
+
+  // Loop index.
+  uint global_id [[thread_position_in_grid]],
+  ushort quad_lane [[thread_index_in_quadgroup]],
+  uint quad_threads [[threads_per_grid]]
+) {
+  ushort i = global_id / 4;
+  float x_i = x[i];
+  float y_i = y[i];
+  float z_i = z[i];
+  ushort id = ushort(element[i]);
+  ushort atoms(uint(quad_threads / 4));
+
+  float f_x_next = 0;
+  float f_y_next = 0;
+  float f_z_next = 0;
+
+  LJPotentialParametersMatrix<119, 119> params { paramsRaw };
+  auto paramsBase = params.elements + params.index(id, 0);
+
+  // Calculate nonbonded forces.
+  constexpr ushort group_size = 4;
+  ushort j = group_size * quad_lane;
+  ushort j_max = ~(4 - 1) & atoms;
+  for (; j < j_max; j += group_size * 4) {
+    uchar4 id_j = *(device uchar4*)(element + j);
+    auto c12c6_0 = paramsBase[id_j[0]];
+    auto c12c6_1 = paramsBase[id_j[1]];
+    auto c12c6_2 = paramsBase[id_j[2]];
+    auto c12c6_3 = paramsBase[id_j[3]];
+    float4 c12(c12c6_0.c12, c12c6_1.c12, c12c6_2.c12, c12c6_3.c12);
+    float4 c6 (c12c6_0.c6,  c12c6_1.c6,  c12c6_2.c6,  c12c6_3.c6);
+
+    float4 x_j = *(device float4*)(x + j);
+    float4 y_j = *(device float4*)(y + j);
+    float4 z_j = *(device float4*)(z + j);
+
+    float4 x_delta = x_i - x_j;
+    float4 y_delta = y_i - y_j;
+    float4 z_delta = z_i - z_j;
+
+    float4 r2 = x_delta * x_delta;
+    r2 = fma(y_delta, y_delta, r2);
+    r2 = fma(z_delta, z_delta, r2);
+    r2 = fast::divide(1, r2);
+
+    ushort4 j_vector(j, j + 1, j + 2, j + 3);
+    r2 = select(r2, float4(0), i == j_vector);
+
+    float4 r6 = r2 * r2 * r2;
+    float4 r12 = r6 * r6;
+
+    float4 temp1 = c6 * r6;
+    temp1 = fma(c12, r12, temp1);
+    float4 temp2 = temp1 * r2;
+
+    f_x_next = fma(temp2[0], x_delta[0], f_x_next);
+    f_y_next = fma(temp2[0], y_delta[0], f_y_next);
+    f_z_next = fma(temp2[0], z_delta[0], f_z_next);
+    f_x_next = fma(temp2[1], x_delta[1], f_x_next);
+    f_y_next = fma(temp2[1], y_delta[1], f_y_next);
+    f_z_next = fma(temp2[1], z_delta[1], f_z_next);
+    f_x_next = fma(temp2[2], x_delta[2], f_x_next);
+    f_y_next = fma(temp2[2], y_delta[2], f_y_next);
+    f_z_next = fma(temp2[2], z_delta[2], f_z_next);
+    f_x_next = fma(temp2[3], x_delta[3], f_x_next);
+    f_y_next = fma(temp2[3], y_delta[3], f_y_next);
+    f_z_next = fma(temp2[3], z_delta[3], f_z_next);
+  };
+
+  f_x_next = quad_sum(f_x_next);
+  f_y_next = quad_sum(f_y_next);
+  f_z_next = quad_sum(f_z_next);
+  if (!quad_is_first()) {
+    return;
+  }
+
+  // Properly handle the border of the matrix.
+  for (ushort j = j_max; j < atoms; j += 1) {
+    ushort id_j = ushort(element[j]);
+    auto c12c6 = paramsBase[id_j];
+    float c12 = c12c6.c12;
+    float c6 = c12c6.c6;
+
+    float x_j = x[j];
+    float y_j = y[j];
+    float z_j = z[j];
+
+    // nm: 1e-9
+    float x_delta = x_i - x_j;
+    float y_delta = y_i - y_j;
+    float z_delta = z_i - z_j;
+
+    // nm^-2: 1e18
+    float r2 = x_delta * x_delta;
+    r2 = fma(y_delta, y_delta, r2);
+    r2 = fma(z_delta, z_delta, r2);
+    r2 = fast::divide(1, r2);
+
+    // Check whether j == index. If so, skip the iteration.
+    r2 = (i == j) ? 0 : r2;
+
+    // nm^-6: 1e54
+    float r6 = r2 * r2 * r2;
+
+    // nm^-12: 1e108
+    float r12 = r6 * r6;
+
+    // aJ: 1e-18
+    float temp1 = c6 * r6;
+    temp1 = fma(c12, r12, temp1);
+
+    // aJ * nm^-2: 1e0
+    // 10^-18 * (kg * m^2/s^2) * nm^-2
+    // 10^-18 * (kg/s^2) * 10^18
+    float temp2 = temp1 * r2;
+
+    // aJ/nm: 1e-9
+    // nano-Newtons
+    f_x_next = fma(temp2, x_delta, f_x_next);
+    f_y_next = fma(temp2, y_delta, f_y_next);
+    f_z_next = fma(temp2, z_delta, f_z_next);
+  }
+
+  // Prefetch the accelerations.
+  float a_x_curr = a_x[i];
+  float a_y_curr = a_y[i];
+  float a_z_curr = a_z[i];
+
+  // kg^-1: 1e0
+  DS inverseMass = massesInv[id];
+
+  // m/s^2: 1e0
+  float nm_s2___m_s2 = 1e-9;
+  DS a_scale = DS_mul_float_lhs(nm_s2___m_s2, inverseMass);
+  DS a_x_next = DS_mul_float_rhs(a_scale, f_x_next);
+  DS a_y_next = DS_mul_float_rhs(a_scale, f_y_next);
+  DS a_z_next = DS_mul_float_rhs(a_scale, f_z_next);
+
+  // Prefetch the velocities.
+  float v_x_curr = v_x[i];
+  float v_y_curr = v_y[i];
+  float v_z_curr = v_z[i];
+
+  DS thousandth = args.thousandth;
+  
+  // nm/ps/s: 1e3
+  DS m_s2___nm_ps_s = thousandth;
+  a_x[i] = DS_mul(a_x_next, m_s2___nm_ps_s).hi;
+  a_y[i] = DS_mul(a_y_next, m_s2___nm_ps_s).hi;
+  a_z[i] = DS_mul(a_z_next, m_s2___nm_ps_s).hi;
+
+  // Average the accelerations.
+  // The current value is twice the average acceleration. A later line of
+  // code will correct for the factor of 2.
+  float nm_ps_s___m_s2 = 1e3;
+  DS a_x_sum = DS_add(a_x_next, DS_init_multiplying(nm_ps_s___m_s2, a_x_curr));
+  DS a_y_sum = DS_add(a_y_next, DS_init_multiplying(nm_ps_s___m_s2, a_y_curr));
+  DS a_z_sum = DS_add(a_z_next, DS_init_multiplying(nm_ps_s___m_s2, a_z_curr));
+
+  // nm/ps: 1e3
+  float nm_ps___m_s = 1e3;
+  DS v_x_next = DS_init_multiplying(nm_ps___m_s, v_x_curr);
+  DS v_y_next = DS_init_multiplying(nm_ps___m_s, v_y_curr);
+  DS v_z_next = DS_init_multiplying(nm_ps___m_s, v_z_curr);
+
+  DS multiplier = DS_halved(args.h);
+  v_x_next = DS_add(v_x_next, DS_mul(multiplier, a_x_sum));
+  v_y_next = DS_add(v_y_next, DS_mul(multiplier, a_y_sum));
+  v_z_next = DS_add(v_z_next, DS_mul(multiplier, a_z_sum));
+
+  // nm/ps: 1e3
+  DS m_s___nm_ps = thousandth;
+  v_x[i] = DS_mul(v_x_next, m_s___nm_ps).hi;
+  v_y[i] = DS_mul(v_y_next, m_s___nm_ps).hi;
+  v_z[i] = DS_mul(v_z_next, m_s___nm_ps).hi;
+}
+"""
 }

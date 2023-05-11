@@ -12,7 +12,7 @@ Philip Turner
 
 Molecular dynamics (MD) is a type of physics simulation that examines the interactions between individual atoms and molecules. It is used widely in chemistry, materials science, and molecular nanotechnology to understand phenomena that are difficult to measure experimentally. One example is the testing of atomically precise gears and bearings (Fig. 1), which cannot be manufactured with current technology[^1]. MD reveals how the forces present at the atomic scale create unique design constraints, which differ from macroscale mechanical engineering.
 
-There are numerous software libraries for molecular dynamics, each specializing in simulating a different type of molecule. The fastest library for simulating on personal computers is OpenMM[^2], due to utilization of graphics hardware with massive computational power. However, calling into an external library incurs non-negligible overhead, becoming a bottleneck for very small systems. This research paper details the creation of a new simulation program, which outperforms existing libraries for systems with under 300 atoms (Fig. 2). The program only supports a single type of interaction between atoms, limiting its applicability to noble gases. Future improvements can extend support to other elements such as carbon and hydrogen.
+There are numerous software libraries for molecular dynamics, each specializing in simulating a different type of molecule. The fastest library for simulating on personal computers is OpenMM[^2], due to utilization of graphics hardware with massive computational power. However, calling into an external library incurs non-negligible overhead, becoming a bottleneck for very small systems. This research paper details the creation of a new simulation program, which outperforms existing libraries for systems with under 10,000 atoms (Fig. 2). The program only supports a single type of interaction between atoms, limiting its applicability to noble gases. Future improvements can extend support to other elements such as carbon and hydrogen.
 
 <div align="center">
 
@@ -28,7 +28,7 @@ There are numerous software libraries for molecular dynamics, each specializing 
 
 </div>
 
-<i> <b>Figure 2.</b> Simulation speed of various molecular dynamics libraries when the timestep is 4 fs. OpenMM (red) is faster than all other libraries for 300 - 1 million atoms. The orange line is the Swift code developed for this research paper. It utilizes SIMD parallelism to achieve $O(n)$ scaling between 1 - 8 atoms, faces $O(n^2)$ scaling until 100 atoms, then temporarily becomes $O(n)$ as it utilizes multithreading. At 300 atoms, the Swift code becomes slower than OpenMM.</i>
+<i> <b>Figure 2.</b> Simulation speed of various molecular dynamics libraries when the timestep is 4 fs. OpenMM (blue, red) is faster than all other libraries for 10,000 - 1 million atoms. The orange and cyan lines are the Swift code developed for this research paper. [MolecularRenderer](https://github.com/philipturner/molecular-renderer) utilizes SIMD parallelism to achieve $O(n)$ scaling between 1 - 8 atoms, then faces $O(n^2)$ scaling until 70 atoms. Next, it switches to GPU acceleration and becomes $O(1)$ - bottlenecked by latency. At 10,000 atoms, the Swift code becomes slower than OpenMM.</i>
 
 ## Methods
 
