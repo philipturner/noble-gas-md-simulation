@@ -482,7 +482,6 @@ struct System {
   
   // If this value changes, stall the pipeline to avoid corrupting the other
   // command buffers.
-  var useSIMD: Bool
   var lastH: Double = -1
   var argumentsBuffer: MTLBuffer
   var updatePositionsPipeline: MTLComputePipelineState
@@ -509,7 +508,7 @@ struct System {
   
   // Initialize all the underlying memory. The caller fills in atom positions
   // outside of the loop.
-  init(atoms: Int, ljParameters: LJPotentialParametersMatrix, useSIMD: Bool) {
+  init(atoms: Int, ljParameters: LJPotentialParametersMatrix) {
     self.atoms = atoms
     self.ljParameters = ljParameters
     self.masses = AtomicMasses()
@@ -533,8 +532,7 @@ struct System {
     self.device = MTLCopyAllDevices().first!
     self.commandQueue = device.makeCommandQueue(maxCommandBufferCount: 8)!
     
-    self.useSIMD = useSIMD
-    let source = createGPUEvolveSrc(useSIMD: useSIMD)
+    let source = createGPUEvolveSrc()
     let options = MTLCompileOptions()
     options.fastMathEnabled = false
     let library = try! device.makeLibrary(source: source, options: options)
@@ -1094,7 +1092,7 @@ extension System {
       encoder!.setComputePipelineState(updatePositionsPipeline)
       encoder!.dispatchThreads(atomsSize, threadsPerThreadgroup: tgSize)
       
-      let parallelSize = MTLSizeMake((useSIMD ? 32 : 4) * atoms, 1, 1)
+      let parallelSize = MTLSizeMake(8 * atoms, 1, 1)
       encoder!.setComputePipelineState(updateVelocitiesPipeline)
       encoder!.dispatchThreads(parallelSize, threadsPerThreadgroup: tgSize)
     }
@@ -1111,10 +1109,6 @@ let testingSpeed: Bool = false
 // Whether to use GPU acceleration. This only helps at around 100 atoms.
 let useGPU: Bool = false
 
-// Whether to use SIMD-scoped parallelization or quad-scoped. Quad-scoped is
-// faster after 1800 atoms.
-let useSIMD: Bool = false
-
 if testingSpeed {
   // MARK: - Testing Speed
   
@@ -1126,8 +1120,7 @@ if testingSpeed {
   let trials: Int = 3 // run multiple trials to warm the caches
   
   let atoms: Int = gridWidth.x * gridWidth.y * gridWidth.z
-  var system = System(
-    atoms: atoms, ljParameters: parametersMatrix, useSIMD: useSIMD)
+  var system = System(atoms: atoms, ljParameters: parametersMatrix)
   
   // 2-3 becomes 1, 4-5 becomes 2, 6-7 becomes 3, etc.
   let axisExtentsMinus = gridWidth / 2
@@ -1242,8 +1235,7 @@ if testingSpeed {
     let firstAtomsType: UInt8 = simulationID <= 1 ? 10 : 18
     let secondAtomsType: UInt8 = simulationID <= 0 ? 10 : 18
     let systemAtoms = debuggingLJ ? 2 : 4
-    var system = System(
-      atoms: systemAtoms, ljParameters: parametersMatrix, useSIMD: useSIMD)
+    var system = System(atoms: systemAtoms, ljParameters: parametersMatrix)
     
     // Set atom types.
     let rangeFirst = debuggingLJ ? 0..<1 : 0..<2
@@ -1481,9 +1473,9 @@ struct DoubleSingle {
   }
 }
 
-func createGPUEvolveSrc(useSIMD: Bool = true) -> String {
-  let groupKwd = useSIMD ? "simd" : "quad"
-  let groupSize = useSIMD ? 32 : 4
+func createGPUEvolveSrc() -> String {
+  let groupKwd = "group"
+  let groupSize = 8
   
 return """
 #include <metal_stdlib>
@@ -1724,10 +1716,10 @@ kernel void updateVelocities(
 
   // Loop index.
   uint global_id [[thread_position_in_grid]],
-  ushort \(groupKwd)_lane [[thread_index_in_\(groupKwd)group]],
-  uint \(groupKwd)_threads [[threads_per_grid]]
+  uint group_threads [[threads_per_grid]]
 ) {
   ushort i = global_id / \(groupSize);
+  ushort \(groupKwd)_lane = global_id % \(groupSize);
   float x_i = x[i];
   float y_i = y[i];
   float z_i = z[i];
@@ -1791,10 +1783,13 @@ kernel void updateVelocities(
     f_z_next = fma(temp2[3], z_delta[3], f_z_next);
   };
 
-  f_x_next = \(groupKwd)_sum(f_x_next);
-  f_y_next = \(groupKwd)_sum(f_y_next);
-  f_z_next = \(groupKwd)_sum(f_z_next);
-  if (!\(groupKwd)_is_first()) {
+  f_x_next = quad_sum(f_x_next);
+  f_y_next = quad_sum(f_y_next);
+  f_z_next = quad_sum(f_z_next);
+  f_x_next += simd_shuffle_xor(f_x_next, group_size / 2);
+  f_y_next += simd_shuffle_xor(f_y_next, group_size / 2);
+  f_z_next += simd_shuffle_xor(f_z_next, group_size / 2);
+  if (group_lane != 0) {
     return;
   }
 
