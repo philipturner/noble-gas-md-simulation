@@ -1088,7 +1088,7 @@ extension System {
     precondition(atoms < UInt16.max, "Too many atoms.")
     for _ in 0..<steps {
       let atomsSize = MTLSizeMake(atoms, 1, 1)
-      let tgSize = MTLSizeMake(256, 1, 1)
+      let tgSize = MTLSizeMake(128, 1, 1)
       encoder!.setComputePipelineState(updatePositionsPipeline)
       encoder!.dispatchThreads(atomsSize, threadsPerThreadgroup: tgSize)
       
